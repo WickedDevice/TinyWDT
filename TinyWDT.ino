@@ -1,63 +1,22 @@
 #include <SoftwareSerial.h>
 #include <util/crc16.h>
 #include <avr/wdt.h>
-                                                     // COMMENTS FOR ATTINY45
-#define INITIALIZATION_TIMEOUT_MS 10000L             // no watchdog resets will occur or 10 seconds following a reset
+  
 #define INITIALIZATION_MESSAGE_LENGTH 6              // 2 uint16_t of payload and 1 uint16 of CRC
 #define HEADER_FIRST_BYTE  0x5A
 #define HEADER_SECOND_BYTE 0x96
 
-//#define NANODE_HOST
-//#define DEBUG
+const int host_reset_pin   = 0;                        // PB0 = DIG0
+const int configure_tx_pin = 1;                        // PB1 = DIG1 (not connected to anything, defined only for the benefit of SoftSerial 
+const int led_pin          = 2;                        // PB2 = DIG2
+const int pet_input_pin    = 3;                        // PB3 = DIG3
+const int debug_pin        = 4;                        // PB4 = DIG4
+boolean debug              = false;
+uint8_t debug_state        = 0;
 
-/* THESE VALUES ARE FOR A NANODE USING A1 as the INTERFACE PIN and RESET CONTROL on A0 */
-#ifdef NANODE_HOST
-  #define RESET_DDR DDRC                               // PORTB is the reset / configuration port
-  #define RESET_PORT PORTC                             // 
-  #define RESET_INPUT PINC                             //
-  #define RESET_PIN 0                                  // PB0 is connected ot the reset pin of the host controller
+#define LED_SHORT_BLINK_DURATION_MS      (50)
+#define PET_WATCHDOG_RELEASE_DURATION_MS (5)
 
-  #define PETTING_ARDUINO_PIN 15                       // PB3 (DIG3) is the input pin
-  #define SOFTSERIAL_JUNK_PIN 1                        // PB1 (DIG1) is not connected to anything
-  #define PETTING_INPUT PINC
-  #define PETTING_PIN  1
-
-  #define LED_INVERTED
-  #define LED_DDR  DDRD                                // PORTB is the LED port
-  #define LED_PORT PORTD                               // 
-  #define LED_PIN  6                                   // PB2 is connected to an LED
-#endif
-
-/* THESE SETTINGS ARE FOR AN ATTiny45 */
-#ifndef NANODE_HOST
-  #define RESET_DDR DDRB                               // PORTB is the reset / configuration port
-  #define RESET_PORT PORTB                             // 
-  #define RESET_INPUT PINB                             //
-  #define RESET_PIN 0                                  // PB0 is connected ot the reset pin of the host controller
-
-  #define PETTING_ARDUINO_PIN 3                        // PB3 (DIG3) is the input pin
-  #define SOFTSERIAL_JUNK_PIN 1                        // PB1 (DIG1) is not connected to anything
-  #define PETTING_INPUT PINB
-  #define PETTING_PIN  3
-
-  #define LED_DDR  DDRB                                // PORTB is the LED port
-  #define LED_PORT PORTB                               // 
-  #define LED_PIN  2                                   // PB2 is connected to an LED
-#endif
-
-#ifdef LED_INVERTED
-  #define LED_OFF do{LED_PORT |= _BV(LED_PIN);}while(0)
-  #define LED_ON do{LED_PORT &= ~_BV(LED_PIN);}while(0)  
-#else
-  #define LED_ON do{LED_PORT |= _BV(LED_PIN);}while(0)
-  #define LED_OFF do{LED_PORT &= ~_BV(LED_PIN);}while(0)
-#endif
-#define RESET_LOW do{RESET_DDR   |= _BV(RESET_PIN);RESET_PORT  &= ~_BV(RESET_PIN);} while(0)
-#define RESET_HIGHZ do{RESET_DDR  &= ~_BV(RESET_PIN);}while(0)
-#define HOST_IN_RESET ((RESET_INPUT & _BV(RESET_PIN)) == 0) // True if the host is in reset, i.e. someone / thing is pressing the reset button
-#define CURRENTLY_BEING_PET ((PETTING_INPUT & _BV(PETTING_PIN)) == 0)
-
-  
 void wdt_init(void) __attribute__((naked)) __attribute__((section(".init3")));
 void wdt_init(void){
     MCUSR = 0;
@@ -73,230 +32,204 @@ do                          \
     }                       \
 } while(0)
 
-uint16_t counter = 0;
-uint16_t minimum_wait_period_after_petting_ms = 0;
-uint16_t maximum_wait_period_after_petting_ms = 0;
-uint8_t wdt_enabled = 0;
-uint8_t led_on = 0;
+uint32_t ms_without_being_pet = 0;
+uint32_t min_wait_period_after_petting_ms = 0;
+uint32_t maximum_wait_period_after_petting_ms = 0;
+volatile uint8_t led_on_duration_ms = 0;
+volatile uint8_t check_for_pet_timer_ms = 0;
+volatile uint8_t once_per_millisecond_timer_ms = 0;
+boolean first_pet = true; // no minimum window constraint on the first pet
 
-long previousMicros = 0;
-long interval = 1000; //micros
-uint8_t first_pet = 1; // no minimum window constraint on the first pet
+// this ISR is set up to fire once a millisecond
+// and only impacts 1-byte volatile variables
+// in order to avoid the requirement of locking access
+const uint8_t timer_preload_value = 131; // 256 - 131 = 125 ticks @ 8MHz/64 = 1ms
+ISR(TIM1_OVF_vect){
+  TCNT1 = timer_preload_value;
+  
+  if(led_on_duration_ms > 0){
+    led_on_duration_ms--; 
+  }
+ 
+  if(check_for_pet_timer_ms > 0){
+    check_for_pet_timer_ms--; 
+  }    
+  
+  if(once_per_millisecond_timer_ms > 0){
+    once_per_millisecond_timer_ms--; 
+  }  
+}
 
-SoftwareSerial mySerial(PETTING_ARDUINO_PIN, SOFTSERIAL_JUNK_PIN); // DIG3 = RX, DIG1 = TX (not connected)
+SoftwareSerial mySerial(pet_input_pin, configure_tx_pin); // DIG3 = RX, DIG1 = TX (not connected)
 
 uint16_t checkcrc(uint8_t * buffer);
-uint8_t validateInitializationMessage(uint8_t * buffer);
+boolean validateInitializationMessage(uint8_t * buffer);
 uint16_t bufferToUint16(uint8_t * buffer);
 void perform_reset_sequence(void);
 void blinkLedFast(uint8_t n);
 void blinkLedSlow(uint8_t n);
 
 void setup(){
-  uint32_t currentMillis = millis();
-  uint32_t timeoutMillis = currentMillis + INITIALIZATION_TIMEOUT_MS;  
   uint8_t buffer[INITIALIZATION_MESSAGE_LENGTH];
   uint8_t buffer_index = 0;
   uint8_t header_byte_num = 0;
-  
-  
-  // set all pins to input
-  LED_DDR = _BV(LED_PIN);  // all pins are inputs, except LED pin
-  
-#ifdef DEBUG  
-  Serial.begin(115200);
-  Serial.println("Hello World");
-#endif
+    
+  TCCR1 = 0x07; // divide by 1024
+  TCNT1 = timer_preload_value;
+  TIMSK = _BV(TOIE1);    
+    
+  pinMode(host_reset_pin, INPUT);
+  pinMode(pet_input_pin, INPUT_PULLUP);
+  pinMode(led_pin, OUTPUT);
+  digitalWrite(led_pin, LOW);
 
   blinkLedFast(2);
 
+  if(debug){
+    pinMode(debug_pin, OUTPUT); 
+    digitalWrite(debug_pin, debug_state);    
+  }
+
+  
   mySerial.begin(4800);
   
-  while(currentMillis < timeoutMillis){
-     currentMillis = millis();
-     if(mySerial.available()){
-       uint8_t rx_char = mySerial.read();
-       if(header_byte_num == 0){
-         if(rx_char == HEADER_FIRST_BYTE){
-           header_byte_num++;
-#ifdef DEBUG
-           Serial.println("Received First Header Byte");
-         }
-         else{
-           Serial.println("Not First Header Byte"); 
-#endif
-         }
-       }
-       else if(header_byte_num == 1){
-         if(rx_char == HEADER_SECOND_BYTE){
-           header_byte_num++; 
-#ifdef DEBUG
-           Serial.println("Received Second Header Byte");
-#endif           
-         }
-         else{
-#ifdef DEBUG
-           Serial.println("Received Erroneous Second Header Byte");
-#endif           
-           header_byte_num = 0; 
-         }
-       }
-       else{
-         buffer[buffer_index++] = rx_char;
-       }
-     }
-     
-     if(buffer_index == INITIALIZATION_MESSAGE_LENGTH){     
-       break; 
-     }
-  }
+  for(;;){
   
-#ifdef DEBUG
-  Serial.print("Num Message Bytes Received: ");
-  Serial.println(buffer_index);
-  Serial.print("Buffer: ");
-  for(buffer_index = 0; buffer_index < INITIALIZATION_MESSAGE_LENGTH; buffer_index++){
-    if(buffer[buffer_index] < 16) Serial.print("0");
-    Serial.print(buffer[buffer_index], HEX);
-    Serial.print(" ");
-  }
-  Serial.println();
-#endif    
-  
-  if((buffer_index == INITIALIZATION_MESSAGE_LENGTH) && validateInitializationMessage(buffer)){
-     wdt_enabled = 1;
-     blinkLedFast(2);
+    // handle what happens the hcheck_for_pet_timer_msost is reset by something else
+    if(digitalRead(host_reset_pin) == 0){
+      while(digitalRead(host_reset_pin) == 0){
+        continue; 
+      }
+      soft_reset();
+    }    
+    
+    if(mySerial.available()){
+      uint8_t rx_char = mySerial.read();
+      if(header_byte_num == 0){
+        if(rx_char == HEADER_FIRST_BYTE){
+          header_byte_num++;
+        }
+      }
+      else if(header_byte_num == 1){
+        if(rx_char == HEADER_SECOND_BYTE){
+          header_byte_num++;       
+        }
+        else{         
+          header_byte_num = 0; 
+        }
+      }
+      else{
+        buffer[buffer_index++] = rx_char;
+      }
+    }
      
-#ifdef DEBUG       
-     Serial.println("WDT Function Enabled");     
-     Serial.print("Minimum Window: ");
-     Serial.println(minimum_wait_period_after_petting_ms);
-     Serial.print("Maximum Window: ");
-     Serial.println(maximum_wait_period_after_petting_ms);
-#endif
+    if(buffer_index == INITIALIZATION_MESSAGE_LENGTH){     
+      break; 
+    }
+  } 
+  
+  if(validateInitializationMessage(buffer)){
+    blinkLedFast(2);  
   }
   else{
-     if(buffer_index == 0){       
-       blinkLedSlow(3); // indicate no initialization message received
-#ifdef DEBUG  
-       Serial.println("No Initialization Message Received");            
-#endif
-     }
-     else if(buffer_index < INITIALIZATION_MESSAGE_LENGTH){
-       blinkLedSlow(4); // indicate initialization message too short
-#ifdef DEBUG       
-       Serial.println("Too Short Initialization Message Received");                   
-#endif
-     }
-     else{
-       blinkLedSlow(5); // indicate validation failed
-#ifdef DEBUG         
-       Serial.println("Invalid Initialization Message Received");                                   
-#endif       
-     }
+    // misconfigured, reset the host
+    blinkLedSlow(2);
+    perform_reset_sequence();
   }
   
   mySerial.end();  
+  
 }
 
-void loop(){  
-  uint8_t currently_being_pet = 0;
-  unsigned long currentMicros = micros();
+void loop(){    
   
-  // handle what happens the host is reset by something else
-  if(HOST_IN_RESET){
-    while(HOST_IN_RESET){
+  // handle what happens when the host is reset by something else
+  if(digitalRead(host_reset_pin) == 0){
+    while(digitalRead(host_reset_pin) == 0){
       continue; 
     }
     soft_reset();
   }
   
-  if(wdt_enabled){
+  // the once per millisecond_timer_ms task runs to
+  // increment a counter every millisecond, regardless
+  // of other activity, and the counter can be cleared by 
+  // the check_for_pet_timer_ms task
+  if(once_per_millisecond_timer_ms == 0) {
+    once_per_millisecond_timer_ms = 1;
     
-    if(CURRENTLY_BEING_PET){
-      currently_being_pet = 1;
+    if(debug){
+      debug_state = 1 - debug_state;
+      digitalWrite(debug_pin, debug_state); 
+    }    
+    
+    ms_without_being_pet++; // increase the counter        
+  }
+  
+  // the check_for_pet_timer_ms task runs to 
+  // 1 - determine if the watchdog is currently being pet, and restart the ms_without_being_pet if necessary
+  // 2 - issue a reset if an early pet is detected
+  // 3 - issue a reset if too long has passed without a pet
+  if(check_for_pet_timer_ms == 0){
+    check_for_pet_timer_ms = 1;
+    
+    // issue a reset if either: 
+    // CONDITION #1: the input signal is LOW and the counter is lower than minimum_wait_period_after_petting_ms  
+    if(digitalRead(pet_input_pin) == 0){ // CONDITION #1   
+      if(ms_without_being_pet < min_wait_period_after_petting_ms){
+        if(!first_pet){
+          // the pet signal arrived too early (on the second, or later, pet)    
+          perform_reset_sequence(); 
+        }        
+      }
+              
+      // pet signal must be within the allowable window            
+      ms_without_being_pet = 0; // timing the new window starts from now     
+      led_on_duration_ms = LED_SHORT_BLINK_DURATION_MS; // turn the LED on for 50ms      
+      check_for_pet_timer_ms = PET_WATCHDOG_RELEASE_DURATION_MS; // ignore currently being pet for 5ms          
+      first_pet = false; // by definition, it's no longer the first pet         
     }
-    
-    // scheduled once per millisecond (interval = 1000)
-    if(currentMicros - previousMicros > interval){
-      previousMicros = currentMicros;  
-      
-      counter++; // increase the counter
-      if(led_on > 0){
-        led_on--; 
-      }
-      
-#ifdef DEBUG
-      if((counter % 1000) == 0){
-        Serial.print("."); 
-      }
-#endif
-      
-      // issue a reset if either: 
-      // CONDITION #1: the input signal is LOW and the counter is lower than minimum_wait_period_after_petting_ms
-      // or CONDITION #2: the counter is higher than maximum_wait_period_after_petting
-      if( currently_being_pet && counter < minimum_wait_period_after_petting_ms && first_pet == 0){ // CONDITION #1
-#ifdef DEBUG        
-        Serial.println("Resetting host because of minimum window constraint");    
-        Serial.print("Counter Value = "); 
-        Serial.println(counter);        
-#endif        
+    // or CONDITION #2: the counter is higher than maximum_wait_period_after_petting and not currently being pet
+    else{ // if(digitalRead(pet_input_pin) == 1)
+      if(ms_without_being_pet >= maximum_wait_period_after_petting_ms){ 
+        // the pet signal arrived too late      
         perform_reset_sequence(); 
       }
-      else if(counter >= maximum_wait_period_after_petting_ms){
-#ifdef DEBUG          
-        Serial.println("Resetting host because of maximum window constraint");                                   
-#endif        
-        perform_reset_sequence(); 
-      } 
-    }
-    
-    if(currently_being_pet){ // didn't issue a so reset the watchdog counter
-#ifdef DEBUG    
-      Serial.println("Received Pet Signal, resetting counter");
-#endif      
-      counter = 0; 
-      currently_being_pet = 1;
-      first_pet = 0;
-      led_on = 50; // turn the LED on for 50ms
-      delay(100);   // give the host some time to release the petting signal before starting the count again
-    }        
-    
-    // manage the LED
-    if(led_on){
-      LED_ON;  //turn on the LED
-    }
-    else{
-      LED_OFF; //turn off the LED
-    }
+    }   
+  }
+  
+  // manage the LED
+  if(led_on_duration_ms > 0){
+    digitalWrite(led_pin, HIGH);   //turn on the LED  
+  }
+  else{
+    digitalWrite(led_pin, LOW);    //turn off the LED    
   }
 }
 
-uint8_t validateInitializationMessage(uint8_t * buffer){
+boolean validateInitializationMessage(uint8_t * buffer){
   uint16_t calculated_checksum = 0, received_checksum = 0;
+  boolean valid = true;
   
-  minimum_wait_period_after_petting_ms = bufferToUint16(buffer);
+  min_wait_period_after_petting_ms = bufferToUint16(buffer);
   maximum_wait_period_after_petting_ms = bufferToUint16(buffer+2);
   calculated_checksum = checkcrc(buffer);
   received_checksum = bufferToUint16(buffer + INITIALIZATION_MESSAGE_LENGTH - 2);
+
+  if(calculated_checksum != received_checksum){
+    valid = false;
+  }
   
-#ifdef DEBUG
-  Serial.print("minimum_wait_period_after_petting_ms = ");
-  Serial.println(minimum_wait_period_after_petting_ms);
-  Serial.print("maximum_wait_period_after_petting_ms = ");
-  Serial.println(maximum_wait_period_after_petting_ms);
-  Serial.print("calculated_checksum = ");
-  Serial.println(calculated_checksum, HEX);
-  Serial.print("received_checksum = ");
-  Serial.println(received_checksum, HEX);
-#endif
-    
-  if(calculated_checksum == received_checksum){
-    return 1;
+  if(min_wait_period_after_petting_ms >= maximum_wait_period_after_petting_ms){
+    valid = false; 
   }
-  else{
-    return 0; 
+  
+  // the minimum wait interval
+  if(min_wait_period_after_petting_ms < 5){
+    valid = false; 
   }
+  
+  return valid;
 }
 
 uint16_t bufferToUint16(uint8_t * buffer){
@@ -322,12 +255,13 @@ void perform_reset_sequence(void){
   // blink the LED fast three times
   blinkLedFast(3);
     
-  RESET_LOW;
+  pinMode(host_reset_pin, OUTPUT); 
+  digitalWrite(host_reset_pin, LOW);
 
-  delay(10);                 // minimum pulse width on reset is 2.5us according ot the datasheet
-                             // so 10ms should be plenty
+  delayMicroseconds(10);     // minimum pulse width on reset is 2.5us according ot the datasheet
+                             // so 10us should be plenty
   
-  RESET_HIGHZ;
+  pinMode(host_reset_pin, INPUT);
 
   soft_reset();              // reset the watchdog timer so the dance can begin again  
                              // this is *really* important or the host will try and send a serial message
@@ -338,20 +272,20 @@ void perform_reset_sequence(void){
 void blinkLedFast(uint8_t n){
   uint8_t ii = 0;
   for(ii = 0; ii < n; ii++){
-    LED_ON; // led on
-    delay(50);              // wait on 
-    LED_OFF; // led off
-    delay(150);             // wait off
+    digitalWrite(led_pin, HIGH); // led on
+    delay(50);                   // wait on 
+    digitalWrite(led_pin, LOW);  // led off
+    delay(150);                  // wait off
   } 
 }
 
 void blinkLedSlow(uint8_t n){
   uint8_t ii = 0;
   for(ii = 0; ii < n; ii++){
-    LED_ON;  // led on
-    delay(250);             // wait on 
-    LED_OFF; // led off
-    delay(250);             // wait off
+    digitalWrite(led_pin, HIGH); // led on
+    delay(250);                  // wait on 
+    digitalWrite(led_pin, LOW);  // led off
+    delay(250);                  // wait off
   } 
 }
 
