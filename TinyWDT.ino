@@ -18,6 +18,7 @@ uint8_t debug_state        = 0;
 
 #define LED_SHORT_BLINK_DURATION_MS      (50)
 #define PET_WATCHDOG_RELEASE_DURATION_MS (5)
+#define SETUP_TIMEOUT_DURATION_MS        (10000)
 
 void wdt_init(void) __attribute__((naked)) __attribute__((section(".init3")));
 void wdt_init(void){
@@ -58,6 +59,7 @@ uint32_t maximum_wait_period_after_petting_ms = 0;
 volatile uint8_t led_on_duration_ms = 0;
 volatile uint8_t check_for_pet_timer_ms = 0;
 volatile uint8_t once_per_millisecond_timer_ms = 0;
+volatile uint16_t setup_timeout_timer_ms = 0;
 boolean first_pet = true; // no minimum window constraint on the first pet
 
 // this ISR is set up to fire once a millisecond
@@ -78,6 +80,10 @@ ISR(TIM1_OVF_vect){
   if(once_per_millisecond_timer_ms > 0){
     once_per_millisecond_timer_ms--; 
   }  
+
+  if(setup_timeout_timer_ms > 0){
+    setup_timeout_timer_ms--;
+  }
 }
 
 SoftwareSerial mySerial(pet_input_pin, configure_tx_pin); // DIG3 = RX, DIG1 = TX (not connected)
@@ -93,8 +99,6 @@ void setup(){
   uint8_t buffer[INITIALIZATION_MESSAGE_LENGTH] = { 0 };
   uint8_t buffer_index = 0;
   uint8_t header_byte_num = 0;
-  unsigned long timeout_previousMillis = 0; 
-  const long timeout_interval = 10000;
   
   TCCR1 = 0x07; // divide by 1024
   TCNT1 = timer_preload_value;
@@ -113,12 +117,11 @@ void setup(){
   }
   
   mySerial.begin(4800);
-  
-  timeout_previousMillis = millis();
+  setup_timeout_timer_ms = SETUP_TIMEOUT_DURATION_MS;
   for(;;){
-    unsigned long currentMillis = millis();
-    if (currentMillis - timeout_previousMillis >= timeout_interval){
-      timeout_previousMillis = currentMillis;
+    if (setup_timeout_timer_ms == 0){
+      setup_timeout_timer_ms = SETUP_TIMEOUT_DURATION_MS;
+            
       // check to see if there is a valid EEPROM configuration
       eepromRestoreConfig(buffer);
       if(validateInitializationMessage(buffer)){
@@ -142,7 +145,7 @@ void setup(){
     }    
     
     if(mySerial.available()){
-      timeout_previousMillis = currentMillis;
+      setup_timeout_timer_ms = SETUP_TIMEOUT_DURATION_MS;
       uint8_t rx_char = mySerial.read();
       if(header_byte_num == 0){
         if(rx_char == HEADER_FIRST_BYTE){
