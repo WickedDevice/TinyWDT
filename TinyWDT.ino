@@ -1,7 +1,9 @@
 #include <SoftwareSerial.h>
 #include <util/crc16.h>
 #include <avr/wdt.h>
-  
+#include <avr/eeprom.h>
+
+#define EEPROM_CONFIG_OFFSET          32             // mainly just want to avoid storing it at address zero
 #define INITIALIZATION_MESSAGE_LENGTH 6              // 2 uint16_t of payload and 1 uint16 of CRC
 #define HEADER_FIRST_BYTE  0x5A
 #define HEADER_SECOND_BYTE 0x96
@@ -31,6 +33,24 @@ do                          \
     {                       \
     }                       \
 } while(0)
+
+void eepromRestoreConfig(uint8_t * buffer){ 
+  for(uint8_t ii = 0; ii < INITIALIZATION_MESSAGE_LENGTH; ii++){
+    uint16_t addr = EEPROM_CONFIG_OFFSET + ii;
+    buffer[ii] = eeprom_read_byte((uint8_t *) addr);
+  }
+}
+
+void eepromSaveConfig(uint8_t * buffer){
+  for(uint8_t ii = 0; ii < INITIALIZATION_MESSAGE_LENGTH; ii++){
+    uint16_t addr = EEPROM_CONFIG_OFFSET + ii;
+    uint8_t current_value = eeprom_read_byte((uint8_t *) addr);
+    uint8_t new_value = buffer[ii];
+    if(current_value != new_value){
+      eeprom_write_byte((uint8_t *) addr, new_value);
+    }
+  }
+}
 
 uint32_t ms_without_being_pet = 0;
 uint32_t min_wait_period_after_petting_ms = 0;
@@ -70,10 +90,12 @@ void blinkLedFast(uint8_t n);
 void blinkLedSlow(uint8_t n);
 
 void setup(){
-  uint8_t buffer[INITIALIZATION_MESSAGE_LENGTH];
+  uint8_t buffer[INITIALIZATION_MESSAGE_LENGTH] = { 0 };
   uint8_t buffer_index = 0;
   uint8_t header_byte_num = 0;
-    
+  unsigned long timeout_previousMillis = 0; 
+  const long timeout_interval = 10000;
+  
   TCCR1 = 0x07; // divide by 1024
   TCNT1 = timer_preload_value;
   TIMSK = _BV(TOIE1);    
@@ -89,11 +111,27 @@ void setup(){
     pinMode(debug_pin, OUTPUT); 
     digitalWrite(debug_pin, debug_state);    
   }
-
   
   mySerial.begin(4800);
   
+  timeout_previousMillis = millis();
   for(;;){
+    unsigned long currentMillis = millis();
+    if (currentMillis - timeout_previousMillis >= timeout_interval){
+      timeout_previousMillis = currentMillis;
+      // check to see if there is a valid EEPROM configuration
+      eepromRestoreConfig(buffer);
+      if(validateInitializationMessage(buffer)){
+        break;
+      }      
+      else{
+        // if there's not a valid backup clear the buffer state
+        // and keep on waiting for a valid message to come in
+        memset(buffer, 0, INITIALIZATION_MESSAGE_LENGTH);
+        buffer_index = 0;
+        header_byte_num = 0;
+      }
+    }
   
     // handle what happens the hcheck_for_pet_timer_msost is reset by something else
     if(digitalRead(host_reset_pin) == 0){
@@ -104,6 +142,7 @@ void setup(){
     }    
     
     if(mySerial.available()){
+      timeout_previousMillis = currentMillis;
       uint8_t rx_char = mySerial.read();
       if(header_byte_num == 0){
         if(rx_char == HEADER_FIRST_BYTE){
@@ -127,17 +166,31 @@ void setup(){
       break; 
     }
   } 
-  
+ 
   if(validateInitializationMessage(buffer)){
+    eepromSaveConfig(buffer);
     blinkLedFast(2);  
   }
   else{
     // misconfigured, reset the host
     blinkLedSlow(2);
     perform_reset_sequence();
-  }
+  }      
   
   mySerial.end();  
+
+  // special case code for watchdog timer disabled settings
+  // in this configuration, just wait to detect external reset and follow suit
+  if((min_wait_period_after_petting_ms == 0xffff) && (maximum_wait_period_after_petting_ms == 0xffff)){
+    for(;;){
+      if(digitalRead(host_reset_pin) == 0){
+        while(digitalRead(host_reset_pin) == 0){
+          continue; 
+        }
+        soft_reset();
+      }          
+    }
+  }
   
 }
 
